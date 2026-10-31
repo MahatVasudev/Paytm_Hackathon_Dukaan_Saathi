@@ -2,7 +2,11 @@ python-telegram-bot
 python-dotenv
 psycopg[binary]
 tzdata
-telegram
-python-dotenv
 sarvamai
 aiohttp
+requests
+pydantic>=2
+sqlalchemy[asyncio]
+asyncpg
+greenlet
+groq

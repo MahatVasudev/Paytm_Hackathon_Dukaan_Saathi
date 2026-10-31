@@ -185,7 +185,7 @@ db_schema_context = {
     }
 }
 
-with open("schema_context.json", "w", encoding="utf-8") as file:
+with open("./schema_context.json", "w", encoding="utf-8") as file:
     json.dump(db_schema_context, file, indent=4)
 
 print("Schema context with dynamic keys successfully saved to schema_context.json")

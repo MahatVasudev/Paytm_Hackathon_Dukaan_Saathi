@@ -12,7 +12,7 @@ def to_paise(rupees: Decimal) -> int:
 
 def to_rupees(paise: int) -> Decimal:
     """Converts Paise (Integer) to Rupees (Decimal) for DB reads/LLM outputs."""
-    return Decimal(paise) / Decimal("100")
+    return (Decimal(paise) / Decimal("100")).quantize(Decimal("0.01"))
 
 # 2. Execution Context
 class ExecutionContext:
@@ -23,13 +23,51 @@ class ExecutionContext:
         self.state: Dict[str, Any] = {}  # Stores results of step bindings ($vars)
 
     def resolve_ref(self, value: Any) -> Any:
-        """Resolves a $var reference from the current state."""
-        if isinstance(value, str) and value.startswith("$"):
-            var_name = value[1:]
-            if var_name not in self.state:
-                raise ValueError(f"Unresolved reference: {value}")
-            return self.state[var_name]
-        return value
+        """Resolves a $var reference, including dot-notation like $party_1.id or $party_1.party_id."""
+        if not (isinstance(value, str) and value.startswith("$")):
+            return value
+
+        ref_path = value[1:].split(".")
+        root_var = ref_path[0]
+
+        if root_var not in self.state:
+            raise ValueError(f"Unresolved reference: {value} (root variable '{root_var}' not found in state)")
+
+        current = self.state[root_var]
+
+        # Traverse nested keys if dot-notation is used (e.g. $party_1.id)
+        for segment in ref_path[1:]:
+            if isinstance(current, dict):
+                # Normalize 'id' vs 'party_id' lookups
+                if segment in current:
+                    current = current[segment]
+                elif segment == "id" and "party_id" in current:
+                    current = current["party_id"]
+                elif segment == "party_id" and "id" in current:
+                    current = current["id"]
+                elif segment in ("id", "party_id") and "candidates" in current and len(current["candidates"]) == 1:
+                    # Single unambiguous match returned from find_party
+                    current = current["candidates"][0].get("party_id")
+                else:
+                    raise ValueError(f"Key '{segment}' not found when resolving path '{value}' in {current}")
+            elif hasattr(current, segment):
+                current = getattr(current, segment)
+            else:
+                raise ValueError(f"Cannot traverse segment '{segment}' on type {type(current)} when resolving '{value}'")
+
+        # If the LLM passed just '$var' directly where a scalar was expected
+        if isinstance(current, dict):
+            for key in ("resolved_date", "result"):
+                if key in current:
+                    return current[key]
+            if "party_id" in current:
+                return current["party_id"]
+            if "id" in current:
+                return current["id"]
+            if "candidates" in current and len(current["candidates"]) == 1:
+                return current["candidates"][0].get("party_id")
+
+        return current
 
     def resolve_model(self, model_dump: Dict[str, Any]) -> Dict[str, Any]:
         """Recursively resolves all $vars in a Pydantic model dump."""

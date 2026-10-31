@@ -4,8 +4,43 @@ from src.server.database.sqltypes import party_balances, pending_actions, partie
 from sqlalchemy import select, and_,insert, func, desc, asc, update
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 import json
-from datetime import timedelta
-from decimal import Decimal
+from datetime import timedelta, datetime, date, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict
+import calendar
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _aware(dt: datetime) -> datetime:
+    """Treat naive datetimes as IST so they compare with ctx.now_ist."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=IST)
+
+
+async def _stage_pending(ctx: ExecutionContext, intent: str, fields: dict, awaiting: str = "confirmation",
+                         minutes: int = 10) -> int:
+    """Insert a pending_actions row. The DB allows ONE 'open' action per business,
+    so any older open action is cancelled first. Fields are JSON-safe (Decimal/date/Enum)."""
+    await ctx.conn.execute(
+        update(pending_actions)
+        .where(pending_actions.c.business_id == ctx.business_id, pending_actions.c.status == "open")
+        .values(status="cancelled")
+    )
+    res = await ctx.conn.execute(
+        insert(pending_actions).values(
+            business_id=ctx.business_id,
+            intent=intent,
+            collected_fields=json.loads(json.dumps(fields, default=str)),
+            awaiting=awaiting,
+            status="open",
+            expires_at=ctx.now_ist + timedelta(minutes=minutes),
+        ).returning(pending_actions.c.id)
+    )
+    return res.scalar_one()
+
+
+def _dump(op) -> dict:
+    return op.model_dump(mode="json", exclude_none=True)
 
 async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -> ResultEnvelope:
     # 2. Extract the string ID from the nested PartyRefExisting object and cast to integer
@@ -25,7 +60,7 @@ async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -
     if not row or not row.balance:
         # If no balance exists, it means they are settled or it's a new party
         return ResultEnvelope(status="ok", data={
-            "balance": "1.00", 
+            "balance": "0.00",
             "direction": "settled"
         })
         
@@ -34,9 +69,9 @@ async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -
     balance_rupees = to_rupees(abs(current_balance_paise))
     
     # 5. Resolve direction based on your schema's view definition
-    if current_balance_paise > 1:
+    if current_balance_paise > 0:
         direction = "they_owe_you"
-    elif current_balance_paise < 1:
+    elif current_balance_paise < 0:
         direction = "you_owe_them"
     else:
         direction = "settled"
@@ -51,7 +86,7 @@ async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -
 
 
 async def execute_propose_payment(op: ProposePaymentOp, ctx: ExecutionContext) -> ResultEnvelope:
-    current_balance_paise = 1
+    current_balance_paise = 0
     
     # 2. Extract party_id safely. If it's a new party, balance is 0.
     if op.party.ref_type == "existing":
@@ -72,7 +107,7 @@ async def execute_propose_payment(op: ProposePaymentOp, ctx: ExecutionContext) -
 
     # 3. Resolve 'settle_all' vs 'amount'
     if op.settle_all:
-        if current_balance_paise == 1:
+        if current_balance_paise == 0:
             return ResultEnvelope(status="invalid", error="Balance is already zero; nothing to settle.")
         payment_amount_rupees = abs(current_balance_rupees)
     else:
@@ -81,12 +116,12 @@ async def execute_propose_payment(op: ProposePaymentOp, ctx: ExecutionContext) -
     # 4. Resolve 'auto' direction
     direction = op.direction.value
     if direction == "auto":
-        if current_balance_paise == 1:
+        if current_balance_paise == 0:
             return ResultEnvelope(
                 status="needs_input", 
                 data={"field": "direction", "options": ["Received", "Paid"]}
             )
-        direction = "received" if current_balance_paise > 1 else "paid"
+        direction = "received" if current_balance_paise > 0 else "paid"
 
     # 5. Warn if paying more than owed (overpayment)
     warning = None
@@ -94,24 +129,14 @@ async def execute_propose_payment(op: ProposePaymentOp, ctx: ExecutionContext) -
         warning = f"This is ₹{op.amount - abs(current_balance_rupees)} more than the dues."
 
     # 6. Format payload
-    payload = op.model_dump(exclude_none=True)
+    payload = _dump(op)
     payload.update({
         "resolved_amount_paise": to_paise(payment_amount_rupees),
         "resolved_direction": direction,
         "expected_balance_paise": current_balance_paise 
     })
 
-    # 7. Insert into pending_actions matching strict schema constraints
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_payment",
-        collected_fields=payload, # SQLAlchemy JSONB handles dict serialization natively
-        awaiting="confirmation",  # Requires user to confirm the action
-        expires_at=ctx.now_ist + timedelta(minutes=11) # Enforces NOT NULL constraint
-    ).returning(pending_actions.c.id) # Let Postgres generate the BIGINT ID
-    
-    result = await ctx.conn.execute(insert_stmt)
-    action_id = result.scalar_one()
+    action_id = await _stage_pending(ctx, "propose_payment", payload)
 
     return ResultEnvelope(status="ok", data={"action_id": str(action_id), "warning": warning})
 
@@ -212,11 +237,19 @@ async def execute_find_party(op: FindPartyOp, ctx: ExecutionContext) -> ResultEn
     
     # 2. Build the fuzzy search query using pg_trgm similarity
     # We join parties and party_balances to return the balance alongside the match
+    alias_score = (
+        select(func.max(func.similarity(party_aliases.c.normalized_alias, search_term)))
+        .where(party_aliases.c.party_id == parties.c.id)
+        .scalar_subquery()
+    )
     stmt = select(
         parties.c.id,
         parties.c.name,
         parties.c.phone,
-        func.similarity(parties.c.normalized_name, search_term).label("score"),
+        func.greatest(
+            func.similarity(parties.c.normalized_name, search_term),
+            func.coalesce(alias_score, 0),
+        ).label("score"),
         func.coalesce(party_balances.c.balance, 0).label("balance_paise")
     ).outerjoin(
         party_balances,
@@ -239,7 +272,7 @@ async def execute_find_party(op: FindPartyOp, ctx: ExecutionContext) -> ResultEn
     rows = result.fetchall()
     
     if not rows:
-        return ResultEnvelope(status="not_found", data={"message": "No matching parties found."})
+        return ResultEnvelope(status="not_found", data={"message": "No matching parties found.", "queried_name": op.name})
         
     # 3. Format output and apply a basic threshold filter
     candidates = []
@@ -257,8 +290,12 @@ async def execute_find_party(op: FindPartyOp, ctx: ExecutionContext) -> ResultEn
         })
 
     if not candidates:
-        return ResultEnvelope(status="not_found", data={"message": "No close matches found."})
+        return ResultEnvelope(status="not_found", data={"message": "No close matches found.", "queried_name": op.name})
         
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    # A clearly dominant match is treated as found rather than bothering the user
+    if len(candidates) > 1 and candidates[0]["score"] >= 0.85 and candidates[0]["score"] - candidates[1]["score"] >= 0.25:
+        candidates = candidates[:1]
     status = "party_found" if len(candidates) == 1 else "party_ambiguous"
     return ResultEnvelope(status=status, data={"candidates": candidates})
 
@@ -386,22 +423,12 @@ async def execute_propose_sale(op: ProposeSaleOp, ctx: ExecutionContext) -> Resu
         )
 
     # 2. Stage the pending action
-    payload = op.model_dump(exclude_none=True)
+    payload = _dump(op)
     payload.update({
         "resolved_total_paise": total_paise,
         "resolved_paid_paise": paid_paise
     })
-    
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_sale",
-        collected_fields=payload,
-        awaiting="confirmation",
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    result = await ctx.conn.execute(insert_stmt)
-    action_id = result.scalar_one()
+    action_id = await _stage_pending(ctx, "propose_sale", payload)
     
     return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
 
@@ -409,22 +436,12 @@ async def execute_propose_sale(op: ProposeSaleOp, ctx: ExecutionContext) -> Resu
 async def execute_propose_expense(op: ProposeExpenseOp, ctx: ExecutionContext) -> ResultEnvelope:
     amount_paise = to_paise(op.amount)
     
-    payload = op.model_dump(exclude_none=True)
+    payload = _dump(op)
     payload.update({
         "resolved_total_paise": amount_paise,
         "resolved_paid_paise": amount_paise # Expenses are inherently fully paid
     })
-    
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_expense",
-        collected_fields=payload,
-        awaiting="confirmation",
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    result = await ctx.conn.execute(insert_stmt)
-    action_id = result.scalar_one()
+    action_id = await _stage_pending(ctx, "propose_expense", payload)
     
     return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
 
@@ -531,19 +548,10 @@ async def execute_propose_purchase(op: ProposePurchaseOp, ctx: ExecutionContext)
     elif op.payment_status.value == "unknown":
         return ResultEnvelope(status="needs_input", data={"field": "payment_status", "options": ["Paid", "Udhaar", "Part-paid"]})
 
-    payload = op.model_dump(exclude_none=True)
+    payload = _dump(op)
     payload.update({"resolved_total_paise": total_paise, "resolved_paid_paise": paid_paise})
-    
-    stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_purchase",
-        collected_fields=payload,
-        awaiting="confirmation",
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    res = await ctx.conn.execute(stmt)
-    return ResultEnvelope(status="ok", data={"action_id": str(res.scalar_one())})
+    action_id = await _stage_pending(ctx, "propose_purchase", payload)
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
 
 async def execute_propose_void(op: ProposeVoidOp, ctx: ExecutionContext) -> ResultEnvelope:
     target_id = int(op.transaction_id)
@@ -560,17 +568,8 @@ async def execute_propose_void(op: ProposeVoidOp, ctx: ExecutionContext) -> Resu
         
     warning = "Entry is older than 30 days." if (ctx.now_ist - row.created_at).days > 30 else None
 
-    payload = op.model_dump(exclude_none=True)
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_void",
-        collected_fields=payload,
-        awaiting="confirmation",
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    res = await ctx.conn.execute(insert_stmt)
-    return ResultEnvelope(status="ok", data={"action_id": str(res.scalar_one()), "warning": warning})
+    action_id = await _stage_pending(ctx, "propose_void", _dump(op))
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "warning": warning})
 
 async def execute_propose_correction(op: ProposeCorrectionOp, ctx: ExecutionContext) -> ResultEnvelope:
     # A correction is essentially Void + Replace.
@@ -583,26 +582,18 @@ async def execute_propose_correction(op: ProposeCorrectionOp, ctx: ExecutionCont
     if not row or row.status == "voided":
         return ResultEnvelope(status="invalid", error="Transaction not found or already voided.")
 
-    payload = op.model_dump(exclude_none=True)
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="propose_correction",
-        collected_fields=payload,
-        awaiting="confirmation",
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    res = await ctx.conn.execute(insert_stmt)
-    return ResultEnvelope(status="ok", data={"action_id": str(res.scalar_one())})
+    action_id = await _stage_pending(ctx, "propose_correction", _dump(op))
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
 
 # ---------------------------------------------------------
 # REMINDERS
 # ---------------------------------------------------------
 async def execute_create_reminder(op: CreateReminderOp, ctx: ExecutionContext) -> ResultEnvelope:
-    if op.remind_at < ctx.now_ist:
+    remind_at = _aware(op.remind_at)
+    if remind_at < ctx.now_ist:
         return ResultEnvelope(status="invalid", error="Cannot set reminder in the past.")
         
-    warning = "Reminder is more than a year ahead." if (op.remind_at - ctx.now_ist).days > 365 else None
+    warning = "Reminder is more than a year ahead." if (remind_at - ctx.now_ist).days > 365 else None
     
     party_id_val = int(op.party.party_id) if op.party and op.party.ref_type == "existing" else None
 
@@ -613,7 +604,7 @@ async def execute_create_reminder(op: CreateReminderOp, ctx: ExecutionContext) -
                 reminders.c.business_id == ctx.business_id,
                 reminders.c.party_id == party_id_val,
                 reminders.c.status == "pending",
-                func.date(reminders.c.remind_at) == op.remind_at.date()
+                func.date(reminders.c.remind_at) == remind_at.date()
             )
         )
         if (await ctx.conn.execute(dup_stmt)).fetchone():
@@ -623,7 +614,7 @@ async def execute_create_reminder(op: CreateReminderOp, ctx: ExecutionContext) -
         business_id=ctx.business_id,
         party_id=party_id_val,
         note=op.note,
-        remind_at=op.remind_at,
+        remind_at=remind_at,
         status="pending"
     ).returning(reminders.c.id)
     
@@ -637,7 +628,7 @@ async def execute_reschedule_reminder(op: RescheduleReminderOp, ctx: ExecutionCo
             reminders.c.business_id == ctx.business_id,
             reminders.c.status == "pending"
         )
-    ).values(remind_at=op.remind_at).returning(reminders.c.id)
+    ).values(remind_at=_aware(op.remind_at)).returning(reminders.c.id)
     
     res = await ctx.conn.execute(stmt)
     if not res.fetchone():
@@ -664,27 +655,67 @@ async def execute_cancel_reminder(op: CancelReminderOp, ctx: ExecutionContext) -
 # ---------------------------------------------------------
 # UTILITY & CONTROL
 # ---------------------------------------------------------
+def _month_bounds(y: int, m: int):
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
 async def execute_resolve_date(op: ResolveDateOp, ctx: ExecutionContext) -> ResultEnvelope:
-    # A lightweight python-side resolution. (In production, this could call an NLP date parser)
+    """Python-side resolution of common English/Hinglish date phrases (no LLM date math)."""
     exp = op.expression.lower().strip()
-    resolved = None
+    today = ctx.now_ist.date()
+    prefer = op.prefer.value
+    d_from = d_to = None
     assumption = ""
 
-    if exp in ("today", "aaj"):
-        resolved = ctx.now_ist.date()
-        assumption = "Today"
-    elif exp in ("yesterday", "kal") and op.prefer.value == "past":
-        resolved = (ctx.now_ist - timedelta(days=1)).date()
-        assumption = "Yesterday"
-    elif exp in ("tomorrow", "kal") and op.prefer.value == "future":
-        resolved = (ctx.now_ist + timedelta(days=1)).date()
-        assumption = "Tomorrow"
-    else:
-        # Fallback to today if not perfectly matched for MVP
-        resolved = ctx.now_ist.date()
-        assumption = f"Assuming today for '{exp}'"
+    def one(d: date, label: str):
+        nonlocal d_from, d_to, assumption
+        d_from = d_to = d
+        assumption = label
 
-    return ResultEnvelope(status="ok", data={"resolved_date": resolved.isoformat(), "assumption": assumption})
+    if exp in ("today", "aaj", "aj"):
+        one(today, "Today")
+    elif exp in ("yesterday", "beeta hua kal", "kal") and not (exp == "kal" and prefer == "future"):
+        one(today - timedelta(days=1), "Yesterday")
+    elif exp in ("tomorrow", "kal", "aane wala kal"):
+        one(today + timedelta(days=1), "Tomorrow")
+    elif exp in ("parso", "day before yesterday"):
+        one(today - timedelta(days=2), "Day before yesterday")
+    elif exp in ("this week", "is hafte", "is week"):
+        d_from = today - timedelta(days=today.weekday()); d_to = today; assumption = "This week (Mon to today)"
+    elif exp in ("last week", "pichle hafte", "pichhle hafte"):
+        end = today - timedelta(days=today.weekday() + 1)
+        d_from, d_to = end - timedelta(days=6), end; assumption = "Last week (Mon-Sun)"
+    elif exp in ("this month", "is mahine", "is month"):
+        d_from, d_to = _month_bounds(today.year, today.month)[0], today; assumption = "This month so far"
+    elif exp in ("last month", "pichle mahine", "pichhle mahine"):
+        y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+        d_from, d_to = _month_bounds(y, m); assumption = "Last month"
+    elif exp in ("this year", "is saal"):
+        d_from, d_to = date(today.year, 1, 1), today; assumption = "This year so far"
+    elif exp.startswith("last ") and exp.endswith(" days") and exp[5:-5].strip().isdigit():
+        n = int(exp[5:-5]); d_from, d_to = today - timedelta(days=n - 1), today; assumption = f"Last {n} days"
+    else:
+        months = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+        months.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
+        parsed = None
+        try:
+            parsed = date.fromisoformat(exp)
+        except ValueError:
+            pass
+        if parsed:
+            one(parsed, parsed.isoformat())
+        elif exp in months:
+            m = months[exp]
+            y = today.year if m <= today.month else today.year - 1
+            d_from, d_to = _month_bounds(y, m); assumption = f"{calendar.month_name[m]} {y}"
+        else:
+            one(today, f"Assuming today for '{exp}'")
+
+    data = {"assumption": assumption, "resolved_date": d_from.isoformat(),
+            "resolved_from": d_from.isoformat(), "resolved_to": d_to.isoformat()}
+    if op.mode.value == "datetime":
+        data["resolved_datetime"] = datetime(d_from.year, d_from.month, d_from.day, 10, 0, tzinfo=IST).isoformat()
+    return ResultEnvelope(status="ok", data=data)
 
 async def execute_calculate(op: CalculateOp, ctx: ExecutionContext) -> ResultEnvelope:
     # Operands are pre-resolved $vars or Decimals due to Pydantic/ExecutionContext pipeline
@@ -703,28 +734,214 @@ async def execute_calculate(op: CalculateOp, ctx: ExecutionContext) -> ResultEnv
         result_val = ops[0] / ops[1]
     elif op.calc_op == CalcOp.PERCENT_OF:
         result_val = (ops[0] / Decimal("100")) * ops[1]
+    elif op.calc_op == CalcOp.PCT_CHANGE:
+        if ops[0] == 0:
+            return ResultEnvelope(status="ok", data={"result": "0.00", "is_undefined": True})
+        result_val = (ops[1] - ops[0]) / ops[0] * Decimal("100")
+    elif op.calc_op == CalcOp.MIN:
+        result_val = min(ops)
+    elif op.calc_op == CalcOp.MAX:
+        result_val = max(ops)
     
     # Half-up rounding to 2 decimals
     final_val = result_val.quantize(Decimal("0.01"))
     return ResultEnvelope(status="ok", data={"result": str(final_val)})
 
 async def execute_ask_user(op: AskUserOp, ctx: ExecutionContext) -> ResultEnvelope:
-    payload = op.model_dump(exclude_none=True)
+    """
+    Stages an explicit question for the user (e.g., confirming an assumption or picking an option).
+    Halts execution and returns 'needs_input'.
+    """
     
-    insert_stmt = insert(pending_actions).values(
-        business_id=ctx.business_id,
-        intent="ask_user",
-        collected_fields=payload,
-        awaiting=op.kind.value,
-        expires_at=ctx.now_ist + timedelta(minutes=10)
-    ).returning(pending_actions.c.id)
-    
-    res = await ctx.conn.execute(insert_stmt)
-    return ResultEnvelope(status="needs_input", data={"action_id": str(res.scalar_one()), "ask_payload": payload})
+    awaiting_val = op.kind.value if hasattr(op.kind, "value") else op.kind
+    action_id = await _stage_pending(ctx, "ask_user", op.model_dump(mode="json"), awaiting=awaiting_val, minutes=60)
+
+    # 3. Return the envelope instructing the orchestrator to halt and ask the user
+    # The dictionary provided to `data` maps directly to what your dispatch_orchestrator_result expects
+    return ResultEnvelope(
+        status="needs_input",
+        data={
+            "action_id": str(action_id),
+            "kind": awaiting_val,
+            "field": op.field,
+            # Ensure nested models (like AskOption) are converted to dicts for the orchestrator
+            "options": [opt.model_dump() if hasattr(opt, "model_dump") else opt for opt in op.options],
+            "slots": op.slots
+        }
+    )
+
+async def execute_edit_pending(op: EditPendingOp, ctx: ExecutionContext) -> ResultEnvelope:
+    """Merge changes into the business's single open pending action."""
+    row = (await ctx.conn.execute(
+        select(pending_actions).where(
+            pending_actions.c.business_id == ctx.business_id,
+            pending_actions.c.status == "open",
+        ).order_by(desc(pending_actions.c.created_at)).limit(1)
+    )).fetchone()
+    if not row:
+        return ResultEnvelope(status="not_found", data={"message": "No pending entry to edit."})
+
+    fields = dict(row.collected_fields or {})
+    changes = op.changes.model_dump(mode="json", exclude_none=True)
+    fields.update(changes)
+    if "total" in changes:
+        fields["resolved_total_paise"] = to_paise(Decimal(str(changes["total"])))
+    status = fields.get("payment_status")
+    if status == "paid_in_full" and "resolved_total_paise" in fields:
+        fields["resolved_paid_paise"] = fields["resolved_total_paise"]
+    elif status == "unpaid":
+        fields["resolved_paid_paise"] = 0
+    elif "paid_amount" in changes:
+        fields["resolved_paid_paise"] = to_paise(Decimal(str(changes["paid_amount"])))
+
+    await ctx.conn.execute(
+        update(pending_actions).where(pending_actions.c.id == row.id)
+        .values(collected_fields=json.loads(json.dumps(fields, default=str)),
+                expires_at=ctx.now_ist + timedelta(minutes=10))
+    )
+    return ResultEnvelope(status="ok", data={"action_id": str(row.id)})
+
 
 async def execute_reply(op: ReplyOp, ctx: ExecutionContext) -> ResultEnvelope:
     # Signals the end of the plan with a template response
     return ResultEnvelope(status="ok", data={"template_id": op.template_id, "slots": op.slots})
+
+
+# ---------------------------------------------------------
+# CONFIRM / CANCEL a staged pending action (the only place ledger rows are written)
+# ---------------------------------------------------------
+def _e164(phone):
+    if not phone:
+        return None
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if str(phone).startswith("+") and 7 <= len(digits) <= 15:
+        return "+" + digits
+    if len(digits) == 10:
+        return "+91" + digits
+    return None
+
+
+async def _party_id_from_ref(ctx: ExecutionContext, ref, default_type: str):
+    """existing -> id; new -> reuse exact-name party or create it; none/missing -> None."""
+    if not isinstance(ref, dict) or ref.get("ref_type") == "none":
+        return None
+    if ref.get("ref_type") == "existing":
+        return int(ref["party_id"])
+    name = ref["name"].strip()
+    norm = name.lower()
+    row = (await ctx.conn.execute(
+        select(parties.c.id).where(parties.c.business_id == ctx.business_id, parties.c.normalized_name == norm).limit(1)
+    )).fetchone()
+    if row:
+        return row.id
+    res = await ctx.conn.execute(insert(parties).values(
+        business_id=ctx.business_id, name=name, normalized_name=norm,
+        phone=_e164(ref.get("phone")), type=ref.get("type") or default_type,
+        created_at=ctx.now_ist,
+    ).returning(parties.c.id))
+    return res.scalar_one()
+
+
+async def execute_confirm_pending(ctx: ExecutionContext, action_id: int | None = None,
+                                  cancel: bool = False) -> ResultEnvelope:
+    conds = [pending_actions.c.business_id == ctx.business_id, pending_actions.c.status == "open"]
+    if action_id is not None:
+        conds.append(pending_actions.c.id == action_id)
+    row = (await ctx.conn.execute(
+        select(pending_actions).where(*conds).order_by(desc(pending_actions.c.created_at)).limit(1)
+    )).fetchone()
+    if not row:
+        return ResultEnvelope(status="not_found", data={"message": "Nothing is waiting for confirmation."})
+
+    async def close(status):
+        await ctx.conn.execute(update(pending_actions).where(pending_actions.c.id == row.id).values(status=status))
+
+    if cancel:
+        await close("cancelled")
+        return ResultEnvelope(status="ok", data={"cancelled": True, "intent": row.intent})
+    if row.expires_at < ctx.now_ist:
+        await close("expired")
+        return ResultEnvelope(status="invalid", error="That entry expired. Please send it again.")
+    if row.intent not in ("propose_sale", "propose_purchase", "propose_expense", "propose_payment",
+                          "propose_void", "propose_correction"):
+        return ResultEnvelope(status="not_found", data={"message": "Nothing is waiting for confirmation."})
+
+    f = row.collected_fields or {}
+    now = ctx.now_ist
+    txn_date = date.fromisoformat(f["date"]) if f.get("date") else now.date()
+    intent = row.intent
+    summary: Dict[str, Any] = {"intent": intent}
+
+    if intent in ("propose_sale", "propose_purchase", "propose_expense", "propose_payment"):
+        if intent == "propose_sale":
+            ttype, default_pt = "sale", "customer"
+        elif intent == "propose_purchase":
+            ttype, default_pt = "purchase", "supplier"
+        elif intent == "propose_expense":
+            ttype, default_pt = "expense", "customer"
+        else:
+            ttype = "payment_received" if f.get("resolved_direction") == "received" else "payment_paid"
+            default_pt = "customer" if ttype == "payment_received" else "supplier"
+        party_id = None if intent == "propose_expense" else await _party_id_from_ref(ctx, f.get("party"), default_pt)
+        if intent == "propose_payment":
+            total = int(f["resolved_amount_paise"]); paid = total
+        else:
+            total = int(f["resolved_total_paise"]); paid = int(f["resolved_paid_paise"])
+        res = await ctx.conn.execute(insert(transactions).values(
+            business_id=ctx.business_id, party_id=party_id, type=ttype,
+            total_amount=total, paid_amount=paid, category=f.get("category"),
+            note=f.get("note") or f.get("item_text"), transaction_date=txn_date,
+            status="confirmed", source="text", created_at=now, confirmed_at=now,
+        ).returning(transactions.c.id))
+        summary.update(transaction_id=str(res.scalar_one()), type=ttype,
+                       total=str(to_rupees(total)), paid=str(to_rupees(paid)))
+        if party_id:
+            bal = (await ctx.conn.execute(select(party_balances.c.balance, ).where(
+                party_balances.c.business_id == ctx.business_id, party_balances.c.party_id == party_id))).fetchone()
+            b = bal.balance if bal and bal.balance else 0
+            summary.update(balance=str(to_rupees(abs(b))),
+                           direction="they_owe_you" if b > 0 else "you_owe_them" if b < 0 else "settled")
+
+    elif intent == "propose_void":
+        res = await ctx.conn.execute(update(transactions).where(
+            transactions.c.id == int(f["transaction_id"]), transactions.c.business_id == ctx.business_id,
+            transactions.c.status != "voided",
+        ).values(status="voided", voided_at=now).returning(transactions.c.id))
+        if not res.fetchone():
+            return ResultEnvelope(status="invalid", error="That entry was not found or is already voided.")
+        summary.update(transaction_id=str(f["transaction_id"]), voided=True)
+
+    else:  # propose_correction
+        ch = f.get("changes", {})
+        cur = (await ctx.conn.execute(select(transactions).where(
+            transactions.c.id == int(f["transaction_id"]), transactions.c.business_id == ctx.business_id,
+            transactions.c.status == "confirmed"))).fetchone()
+        if not cur:
+            return ResultEnvelope(status="invalid", error="That entry was not found or is voided.")
+        vals: Dict[str, Any] = {}
+        total = to_paise(Decimal(str(ch["total"]))) if "total" in ch else cur.total_amount
+        paid = cur.paid_amount
+        if ch.get("payment_status") == "paid_in_full" or cur.type in ("expense", "payment_received", "payment_paid"):
+            paid = total
+        elif ch.get("payment_status") == "unpaid":
+            paid = 0
+        elif "paid_amount" in ch:
+            paid = to_paise(Decimal(str(ch["paid_amount"])))
+        elif "total" in ch and cur.paid_amount > total:
+            paid = total
+        vals.update(total_amount=total, paid_amount=paid)
+        if "party" in ch:
+            vals["party_id"] = await _party_id_from_ref(ctx, ch["party"], "customer")
+        if "date" in ch:
+            vals["transaction_date"] = date.fromisoformat(ch["date"])
+        for k in ("note", "category"):
+            if k in ch:
+                vals[k] = ch[k]
+        await ctx.conn.execute(update(transactions).where(transactions.c.id == cur.id).values(**vals))
+        summary.update(transaction_id=str(cur.id), corrected=True)
+
+    await close("completed")
+    return ResultEnvelope(status="ok", data={"committed": True, **summary})
 
 
 # - [x] find party

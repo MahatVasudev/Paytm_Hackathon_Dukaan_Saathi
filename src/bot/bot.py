@@ -10,9 +10,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandler,  
                           ContextTypes, MessageHandler, filters)
 
-import docai  
-import stt  # Make sure your STT file is named stt.py
-from llm import get_execution_plan  
+import src.bot.docai  
+import src.bot.stt  # Make sure your STT file is named stt.py
+from src.bot.llm import get  
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -148,6 +148,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.exception("LLM generation failed")
             await update.message.reply_text(f"❌ Error getting LLM response: {e}")
+
+
+
 
 def main():
     app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
