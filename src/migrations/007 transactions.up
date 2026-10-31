@@ -1,0 +1,59 @@
+-- All amounts are integer paise and always positive; the sign of a balance is
+-- derived from `type` in the party_balances view, never stored.
+CREATE TABLE transactions (
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    business_id       BIGINT      NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    party_id          BIGINT,                 -- NULL for plain cash sales / expenses
+    type              TEXT        NOT NULL
+                      CHECK (type IN ('sale', 'purchase', 'expense',
+                                      'payment_received', 'payment_paid')),
+    total_amount      BIGINT      NOT NULL CHECK (total_amount > 0),
+    paid_amount       BIGINT      NOT NULL DEFAULT 0
+                      CHECK (paid_amount >= 0 AND paid_amount <= total_amount),
+    category          TEXT,
+    note              TEXT,
+    transaction_date  DATE        NOT NULL
+                      DEFAULT ((now() AT TIME ZONE 'Asia/Kolkata')::date),
+    status            TEXT        NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'confirmed', 'voided')),
+    source            TEXT        NOT NULL DEFAULT 'text'
+                      CHECK (source IN ('text', 'voice')),
+    source_message_id BIGINT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at      TIMESTAMPTZ,
+    voided_at         TIMESTAMPTZ,
+
+    UNIQUE (id, business_id),
+    -- party / message must belong to the same business
+    FOREIGN KEY (party_id, business_id)
+        REFERENCES parties (id, business_id),
+    FOREIGN KEY (source_message_id, business_id)
+        REFERENCES messages (id, business_id),
+
+    -- a payment is fully "paid" by definition
+    CONSTRAINT payment_is_fully_paid
+        CHECK (type NOT IN ('payment_received', 'payment_paid')
+               OR paid_amount = total_amount),
+    -- payments always involve a party
+    CONSTRAINT payment_needs_party
+        CHECK (type NOT IN ('payment_received', 'payment_paid')
+               OR party_id IS NOT NULL),
+    -- an unpaid remainder is a debt, and a debt needs someone to owe it
+    CONSTRAINT unpaid_needs_party
+        CHECK (paid_amount = total_amount OR party_id IS NOT NULL),
+    -- expenses are never credit
+    CONSTRAINT expense_is_fully_paid
+        CHECK (type <> 'expense' OR paid_amount = total_amount),
+    CONSTRAINT confirmed_has_timestamp
+        CHECK (status <> 'confirmed' OR confirmed_at IS NOT NULL),
+    CONSTRAINT voided_has_timestamp
+        CHECK ((status = 'voided') = (voided_at IS NOT NULL))
+);
+
+CREATE INDEX transactions_party_idx
+    ON transactions (business_id, party_id, status);
+CREATE INDEX transactions_date_idx
+    ON transactions (business_id, transaction_date)
+    WHERE status = 'confirmed';
+CREATE INDEX transactions_message_idx
+    ON transactions (source_message_id) WHERE source_message_id IS NOT NULL;

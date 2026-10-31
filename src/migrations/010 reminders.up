@@ -1,0 +1,18 @@
+-- No amount stored: the balance is looked up when the reminder fires.
+CREATE TABLE reminders (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    business_id BIGINT      NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    party_id    BIGINT,
+    note        TEXT,
+    remind_at   TIMESTAMPTZ NOT NULL,
+    status      TEXT        NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'processing', 'sent', 'failed', 'cancelled')),
+    attempts    INTEGER     NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    sent_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (party_id, business_id) REFERENCES parties (id, business_id)
+);
+
+-- the scheduler's polling query: pending AND remind_at <= now()
+CREATE INDEX reminders_due_idx ON reminders (remind_at) WHERE status = 'pending';
