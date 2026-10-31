@@ -36,6 +36,7 @@ from src.server.utils import PromptMaker
 from src.server.description.base_prompt import BASE_PROMPT_V1 
 
 import re
+from pydantic import ValidationError
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -457,14 +458,24 @@ class DukaanOrchestrator:
                 resolved = ctx.resolve_model(call_dict)
                 self._coerce_party_refs(resolved)
                 op_cls = next(op for op in ALL_OPERATIONS if op.model_fields["op"].default == op_name)
-                op_instance = op_cls(**resolved)
+                if op_name in ("reply", "ask_user"):
+                    # Validate the plan-time shape (slots must be $refs), then attach the resolved
+                    # values: the "no numeric literals" rule is for the LLM, not for executor output.
+                    op_instance = op_cls(**call_dict)
+                    op_instance.slots = resolved.get("slots", {})
+                else:
+                    op_instance = op_cls(**resolved)
                 # Savepoint: a failing SQL statement must not poison the rest of the transaction
                 async with ctx.conn.begin_nested():
                     envelope: ResultEnvelope = await handler(op_instance, ctx)
             except Exception as e:
                 logger.exception("Error executing step %s (%s)", bind_var, op_name)
                 sess.reset()
-                return {"type": "error", "message": f"Step '{op_name}' failed: {e}"}
+                if isinstance(e, ValidationError):
+                    detail = "; ".join(err["msg"] for err in e.errors())
+                else:
+                    detail = str(e)
+                return {"type": "error", "message": f"Step '{op_name}' failed: {detail}"}
 
             status = envelope.status
             data = envelope.data if isinstance(envelope.data, dict) else {}
