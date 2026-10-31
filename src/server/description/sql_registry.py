@@ -942,4 +942,4 @@ sql_registry = {
 with open("sql_registry.json", "w", encoding="utf-8") as file:
     json.dump(sql_registry, file, indent=4, ensure_ascii=False)
 
-print("SQL query registry with few-shot examples successfully saved to sql_registry.json")
+print("SQL query registry with few-shot examples successfully saved to sql_registry.json")  
