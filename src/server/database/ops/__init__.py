@@ -158,7 +158,8 @@ async def execute_aggregate(op: AggregateOp, ctx: ExecutionContext) -> ResultEnv
         )
 
     # 4. Resolve Group By
-    group_cols = [] select_cols = [metric_col.label("value")]
+    group_cols = []
+    select_cols = [metric_col.label("value")]
     
     for dim in op.group_by:
         dim_val = dim.value
@@ -204,9 +205,6 @@ async def execute_aggregate(op: AggregateOp, ctx: ExecutionContext) -> ResultEnv
 
     return ResultEnvelope(status="ok", data={"rows": formatted_data})
 
-from src.server.types.pydantic import (
-    
-)
 
 async def execute_find_party(op: FindPartyOp, ctx: ExecutionContext) -> ResultEnvelope:
     # 1. Normalize the search string (lowercase, strip honorifics if your app logic dictates)
