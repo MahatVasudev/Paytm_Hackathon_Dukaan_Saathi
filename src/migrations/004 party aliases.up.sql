@@ -1,4 +1,4 @@
-CREATE TABLE party_aliases (
+CREATE TABLE IF NOT EXISTS party_aliases (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     party_id         BIGINT      NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
     alias            TEXT        NOT NULL,
@@ -7,5 +7,5 @@ CREATE TABLE party_aliases (
     UNIQUE (party_id, normalized_alias)
 );
 
-CREATE INDEX party_aliases_alias_trgm_idx
+CREATE INDEX IF NOT EXISTS party_aliases_alias_trgm_idx
     ON party_aliases USING gin (normalized_alias gin_trgm_ops);

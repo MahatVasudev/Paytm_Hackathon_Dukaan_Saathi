@@ -1,6 +1,6 @@
 -- All amounts are integer paise and always positive; the sign of a balance is
 -- derived from `type` in the party_balances view, never stored.
-CREATE TABLE transactions (
+CREATE TABLE IF NOT EXISTS transactions (
     id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     business_id       BIGINT      NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
     party_id          BIGINT,                 -- NULL for plain cash sales / expenses

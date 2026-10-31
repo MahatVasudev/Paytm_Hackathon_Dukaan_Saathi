@@ -1,4 +1,4 @@
-CREATE TABLE media (
+CREATE TABLE IF NOT EXISTS media (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     message_id       BIGINT      NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     kind             TEXT        NOT NULL CHECK (kind IN ('audio', 'image', 'document')),
@@ -12,5 +12,5 @@ CREATE TABLE media (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX media_message_idx ON media (message_id);
-CREATE INDEX media_sha256_idx  ON media (sha256) WHERE sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS media_message_idx ON media (message_id);
+CREATE INDEX IF NOT EXISTS media_sha256_idx  ON media (sha256) WHERE sha256 IS NOT NULL;

@@ -15,4 +15,4 @@ CREATE TABLE reminders (
 );
 
 -- the scheduler's polling query: pending AND remind_at <= now()
-CREATE INDEX reminders_due_idx ON reminders (remind_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS  reminders_due_idx ON reminders (remind_at) WHERE status = 'pending';

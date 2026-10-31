@@ -1,4 +1,4 @@
-CREATE TABLE businesses (
+CREATE TABLE IF NOT EXISTS businesses (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name             TEXT        NOT NULL,
     channel          TEXT        NOT NULL DEFAULT 'telegram'

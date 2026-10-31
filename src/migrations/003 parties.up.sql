@@ -1,4 +1,4 @@
-CREATE TABLE parties (
+CREATE TABLE IF NOT EXISTS parties (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     business_id     BIGINT      NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
     name            TEXT        NOT NULL,
@@ -13,5 +13,5 @@ CREATE TABLE parties (
 );
 
 -- Two "Ramesh" rows in one business are legal, so normalized_name is NOT unique.
-CREATE INDEX parties_business_name_idx ON parties (business_id, normalized_name);
-CREATE INDEX parties_name_trgm_idx ON parties USING gin (normalized_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS parties_business_name_idx ON parties (business_id, normalized_name);
+CREATE INDEX IF NOT EXISTS parties_name_trgm_idx ON parties USING gin (normalized_name gin_trgm_ops);
