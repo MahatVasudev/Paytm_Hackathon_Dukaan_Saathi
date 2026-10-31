@@ -1,0 +1,6 @@
+python-telegram-bot
+python-dotenv
+psycopg[binary]
+tzdata
+telegram
+python-dotenv
