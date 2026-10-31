@@ -4,3 +4,5 @@ psycopg[binary]
 tzdata
 telegram
 python-dotenv
+sarvamai
+aiohttp
