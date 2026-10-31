@@ -89,6 +89,12 @@ CRITICAL OUTPUT INSTRUCTIONS:
 10. `aggregate` and `list_transactions` use the keys "from" and "to" (not from_date / to_date).
 11. If a "State Context" line is present, the user is answering a question you/the system asked. Use that answer together with the original request to produce the complete new plan.
 
+12. For `get_outstanding` ALWAYS set "perspective": "you_owe_them" for questions like "how much do I owe X" / "main X ko kitna dena hai"; "they_owe_you" for "how much does X owe me" / "X ka kitna baaki hai"; otherwise "both".
+
+13. The user may write in Hindi (Devanagari) or Hinglish. ALWAYS write person/party names in the plan in Latin script, romanized the way an Indian shopkeeper would type them ("रमेश" -> "Ramesh", "प्रिया जी" -> "Priya"), without honorifics (ji, bhai, sahab). Database names are stored in Latin script.
+
+14. Reminders ("remind me", "yaad dilana", "reminder lagao"): first `resolve_date` with mode "datetime" and the user's WHOLE time phrase as `expression` (e.g. "tomorrow 5pm", "kal shaam ko", "in 2 hours", "3 din baad"), then `create_reminder` with remind_at "$date_1.resolved_datetime". Put what to remind in `note` (short, in the user's words). If the reminder is about a person, call `find_party` first and pass the party; otherwise omit `party`. NEVER write `remind_at` yourself or do date/time math: always take it from `resolve_date`. If the user gave no time at all, use `ask_user` (kind "missing_field", field "time").
+
 PAYMENT STATUS RULES (propose_sale / propose_purchase):
 - When payment_status is "unpaid": Do NOT include "paid_amount" (omit the field entirely; do not send 0).
 - When payment_status is "paid_in_full": Do NOT include "paid_amount" (omit the field entirely).

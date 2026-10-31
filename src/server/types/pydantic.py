@@ -89,6 +89,9 @@ class GetOutstandingOp(StrictModel):
     op: Literal["get_outstanding"] = "get_outstanding"
     party: RefOr[PartyRefExisting]
     include_breakdown: bool = False
+    # Which way the user asked: "you_owe_them" for "how much do I owe X",
+    # "they_owe_you" for "how much does X owe me"; "both" if neutral ("balance of X").
+    perspective: DuesDirection = DuesDirection.BOTH
 
 class ListAllDuesOp(StrictModel):
     """3. list_all_dues ★"""

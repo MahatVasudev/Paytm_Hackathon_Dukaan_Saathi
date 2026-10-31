@@ -45,9 +45,17 @@ class ExecutionContext:
                     current = current["party_id"]
                 elif segment == "party_id" and "id" in current:
                     current = current["id"]
-                elif segment in ("id", "party_id") and "candidates" in current and len(current["candidates"]) == 1:
-                    # Single unambiguous match returned from find_party
-                    current = current["candidates"][0].get("party_id")
+                elif "candidates" in current and len(current["candidates"]) == 1:
+                    # Single unambiguous find_party match: allow any of its fields ($p.name, $p.balance, ...)
+                    cand = current["candidates"][0]
+                    key = "party_id" if segment == "id" else "name" if segment == "party_name" else segment
+                    if key not in cand:
+                        raise ValueError(f"Key '{segment}' not found when resolving path '{value}' in {cand}")
+                    current = cand[key]
+                elif segment == "party_name" and "name" in current:
+                    current = current["name"]
+                elif segment == "name" and "party_name" in current:
+                    current = current["party_name"]
                 else:
                     raise ValueError(f"Key '{segment}' not found when resolving path '{value}' in {current}")
             elif hasattr(current, segment):

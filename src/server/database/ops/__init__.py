@@ -8,6 +8,7 @@ from datetime import timedelta, datetime, date, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict
 import calendar
+from src.server.utils.translit import search_key, transliterate, has_devanagari
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -39,49 +40,73 @@ async def _stage_pending(ctx: ExecutionContext, intent: str, fields: dict, await
     return res.scalar_one()
 
 
+async def _preview(ctx: ExecutionContext, kind: str, party, total_paise: int, paid_paise: int,
+                   payment_status: str) -> dict:
+    """Human-readable summary of a staged entry incl. the balance it would result in."""
+    name, current, has_party = "Cash / no party", 0, False
+    if party is not None and getattr(party, "ref_type", None) == "existing":
+        pid = int(party.party_id)
+        name, current, has_party = await _party_name(ctx, pid), await _balance_paise(ctx, pid), True
+    elif party is not None and getattr(party, "ref_type", None) == "new":
+        name, has_party = party.name, True
+    delta = {"sale": total_paise - paid_paise, "purchase": -(total_paise - paid_paise),
+             "payment_received": -total_paise, "payment_paid": total_paise, "expense": 0}[kind]
+    prev = {"transaction_type": kind.replace("_", " ").capitalize(), "party_name": name,
+            "amount": str(to_rupees(total_paise)), "payment_status": payment_status.replace("_", " ")}
+    if has_party:
+        after = current + delta
+        prev.update(resulting_balance=str(to_rupees(abs(after))),
+                    direction_text=_dir(after).replace("_", " "))
+    return prev
+
+
 def _dump(op) -> dict:
     return op.model_dump(mode="json", exclude_none=True)
 
-async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -> ResultEnvelope:
-    # 2. Extract the string ID from the nested PartyRefExisting object and cast to integer
-    target_party_id = int(op.party.party_id)
-    
-    # 3. Tenant Isolation applied at the base query level using exact schema names
-    stmt = select(party_balances.c.balance).where(
-        and_(
-            party_balances.c.business_id == ctx.business_id,
-            party_balances.c.party_id == target_party_id
-        )
-    )
-    
-    result = await ctx.conn.execute(stmt)
-    row = result.fetchone()
-    
-    if not row or not row.balance:
-        # If no balance exists, it means they are settled or it's a new party
-        return ResultEnvelope(status="ok", data={
-            "balance": "0.00",
-            "direction": "settled"
-        })
-        
-    # 4. Strict Money Boundary check on the way out
-    current_balance_paise = row.balance
-    balance_rupees = to_rupees(abs(current_balance_paise))
-    
-    # 5. Resolve direction based on your schema's view definition
-    if current_balance_paise > 0:
-        direction = "they_owe_you"
-    elif current_balance_paise < 0:
-        direction = "you_owe_them"
-    else:
-        direction = "settled"
+def _dir(paise: int) -> str:
+    return "they_owe_you" if paise > 0 else "you_owe_them" if paise < 0 else "settled"
 
-    # (Stretch: You could also query the transactions table here to get 'open entry count' 
-    # and 'last payment date' if op.include_breakdown is True)
+
+async def _party_name(ctx: ExecutionContext, party_id: int) -> str:
+    row = (await ctx.conn.execute(
+        select(parties.c.name).where(parties.c.id == party_id, parties.c.business_id == ctx.business_id)
+    )).fetchone()
+    return row.name if row else "this party"
+
+
+async def _balance_paise(ctx: ExecutionContext, party_id: int) -> int:
+    row = (await ctx.conn.execute(
+        select(party_balances.c.balance).where(
+            party_balances.c.business_id == ctx.business_id, party_balances.c.party_id == party_id)
+    )).fetchone()
+    return int(row.balance) if row and row.balance else 0
+
+
+async def execute_get_outstanding(op: GetOutstandingOp, ctx: ExecutionContext) -> ResultEnvelope:
+    pid = int(op.party.party_id)
+    balance = await _balance_paise(ctx, pid)
+
+    open_count = (await ctx.conn.execute(
+        select(func.count(transactions.c.id)).where(
+            transactions.c.business_id == ctx.business_id, transactions.c.party_id == pid,
+            transactions.c.status == "confirmed", transactions.c.type.in_(["sale", "purchase"]),
+            transactions.c.paid_amount < transactions.c.total_amount)
+    )).scalar_one()
+    last_pay = (await ctx.conn.execute(
+        select(func.max(transactions.c.transaction_date)).where(
+            transactions.c.business_id == ctx.business_id, transactions.c.party_id == pid,
+            transactions.c.status == "confirmed",
+            transactions.c.type.in_(["payment_received", "payment_paid"]))
+    )).scalar_one()
 
     return ResultEnvelope(status="ok", data={
-        "balance": str(balance_rupees),
-        "direction": direction
+        "party_id": str(pid),
+        "party_name": await _party_name(ctx, pid),
+        "balance": str(to_rupees(abs(balance))),
+        "direction": _dir(balance),
+        "open_entry_count": int(open_count) if balance != 0 else 0,
+        "last_payment_date": last_pay.isoformat() if last_pay else None,
+        "perspective": op.perspective.value,
     })
 
 
@@ -137,8 +162,11 @@ async def execute_propose_payment(op: ProposePaymentOp, ctx: ExecutionContext) -
     })
 
     action_id = await _stage_pending(ctx, "propose_payment", payload)
+    pay_kind = "payment_received" if direction == "received" else "payment_paid"
+    preview = await _preview(ctx, pay_kind, op.party, to_paise(payment_amount_rupees),
+                             to_paise(payment_amount_rupees), "paid in full")
 
-    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "warning": warning})
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "warning": warning, "preview": preview})
 
 
 async def execute_aggregate(op: AggregateOp, ctx: ExecutionContext) -> ResultEnvelope:
@@ -177,7 +205,10 @@ async def execute_aggregate(op: AggregateOp, ctx: ExecutionContext) -> ResultEnv
         metric_col = func.avg(transactions.c.total_amount)
     else:
         # e.g., 'sales_total' -> 'sale'
-        target_type = metric_value.replace("_total", "")
+        target_type = {
+            "sales_total": "sale", "purchases_total": "purchase", "expenses_total": "expense",
+            "payments_received_total": "payment_received", "payments_paid_total": "payment_paid",
+        }[metric_value]
         metric_col = func.sum(transactions.c.total_amount).filter(
             transactions.c.type == target_type
         )
@@ -233,7 +264,7 @@ async def execute_aggregate(op: AggregateOp, ctx: ExecutionContext) -> ResultEnv
 
 async def execute_find_party(op: FindPartyOp, ctx: ExecutionContext) -> ResultEnvelope:
     # 1. Normalize the search string (lowercase, strip honorifics if your app logic dictates)
-    search_term = op.name.strip().lower()
+    search_term = search_key(op.name)   # Latin, lowercase, honorifics stripped (रमेश जी -> ramesh)
     
     # 2. Build the fuzzy search query using pg_trgm similarity
     # We join parties and party_balances to return the balance alongside the match
@@ -403,7 +434,10 @@ async def execute_list_transactions(op: ListTransactionsOp, ctx: ExecutionContex
         } for r in rows
     ]
     
-    return ResultEnvelope(status="ok", data={"rows": formatted})
+    data = {"rows": formatted}
+    if op.party and op.party.ref_type == "existing":
+        data["party_name"] = await _party_name(ctx, int(op.party.party_id))
+    return ResultEnvelope(status="ok", data=data)
 
 
 async def execute_propose_sale(op: ProposeSaleOp, ctx: ExecutionContext) -> ResultEnvelope:
@@ -430,7 +464,8 @@ async def execute_propose_sale(op: ProposeSaleOp, ctx: ExecutionContext) -> Resu
     })
     action_id = await _stage_pending(ctx, "propose_sale", payload)
     
-    return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
+    prev = await _preview(ctx, "sale", op.party, total_paise, paid_paise, op.payment_status.value)
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "preview": prev})
 
 
 async def execute_propose_expense(op: ProposeExpenseOp, ctx: ExecutionContext) -> ResultEnvelope:
@@ -443,7 +478,9 @@ async def execute_propose_expense(op: ProposeExpenseOp, ctx: ExecutionContext) -
     })
     action_id = await _stage_pending(ctx, "propose_expense", payload)
     
-    return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
+    prev = await _preview(ctx, "expense", None, amount_paise, amount_paise, "paid in full")
+    prev["party_name"] = op.category
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "preview": prev})
 
 # ---------------------------------------------------------
 # READS
@@ -551,7 +588,8 @@ async def execute_propose_purchase(op: ProposePurchaseOp, ctx: ExecutionContext)
     payload = _dump(op)
     payload.update({"resolved_total_paise": total_paise, "resolved_paid_paise": paid_paise})
     action_id = await _stage_pending(ctx, "propose_purchase", payload)
-    return ResultEnvelope(status="ok", data={"action_id": str(action_id)})
+    prev = await _preview(ctx, "purchase", op.party, total_paise, paid_paise, op.payment_status.value)
+    return ResultEnvelope(status="ok", data={"action_id": str(action_id), "preview": prev})
 
 async def execute_propose_void(op: ProposeVoidOp, ctx: ExecutionContext) -> ResultEnvelope:
     target_id = int(op.transaction_id)
@@ -591,7 +629,13 @@ async def execute_propose_correction(op: ProposeCorrectionOp, ctx: ExecutionCont
 async def execute_create_reminder(op: CreateReminderOp, ctx: ExecutionContext) -> ResultEnvelope:
     remind_at = _aware(op.remind_at)
     if remind_at < ctx.now_ist:
-        return ResultEnvelope(status="invalid", error="Cannot set reminder in the past.")
+        if (ctx.now_ist - remind_at) <= timedelta(minutes=5):
+            remind_at = ctx.now_ist + timedelta(seconds=30)      # LLM/network lag: send ASAP
+        else:
+            when = remind_at.astimezone(IST).strftime("%d %b, %I:%M %p").lstrip("0")
+            return ResultEnvelope(status="needs_input", data={
+                "field": "time",
+                "message": f"{when} has already passed. When should I remind you? (e.g. tomorrow 5pm, in 2 hours)"})
         
     warning = "Reminder is more than a year ahead." if (remind_at - ctx.now_ist).days > 365 else None
     
@@ -619,7 +663,8 @@ async def execute_create_reminder(op: CreateReminderOp, ctx: ExecutionContext) -
     ).returning(reminders.c.id)
     
     res = await ctx.conn.execute(stmt)
-    return ResultEnvelope(status="ok", data={"reminder_id": str(res.scalar_one()), "warning": warning})
+    return ResultEnvelope(status="ok", data={"reminder_id": str(res.scalar_one()), "warning": warning,
+                                              "remind_at": remind_at.astimezone(IST).isoformat(), "note": op.note})
 
 async def execute_reschedule_reminder(op: RescheduleReminderOp, ctx: ExecutionContext) -> ResultEnvelope:
     stmt = update(reminders).where(
@@ -659,33 +704,186 @@ def _month_bounds(y: int, m: int):
     return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
 
 
+import re as _re
+
+_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_NUMWORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+             "eight": 8, "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30,
+             "ek": 1, "do": 2, "teen": 3, "tin": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5, "pach": 5,
+             "chhe": 6, "saat": 7, "aath": 8, "nau": 9, "das": 10, "pandrah": 15, "bees": 20, "tees": 30}
+_UNITS = [  # (regex, seconds)
+    (r"sec(?:ond)?s?|sek(?:and|end)s?|secs?", 1),
+    (r"min(?:ute)?s?|mins?|minat|minut", 60),
+    (r"hours?|hrs?|ghant[aei]|ghanta", 3600),
+    (r"days?|din", 86400),
+    (r"weeks?|hafta|hafte|haftे", 604800),
+]
+_UNIT_RE = "|".join(f"(?P<u{i}>{rx})" for i, (rx, _) in enumerate(_UNITS))
+_DUR_PART = _re.compile(rf"(?P<n>\d+(?:\.\d+)?|{'|'.join(_NUMWORDS)})\s*(?:{_UNIT_RE})\b")
+_DUR_NOISE = _re.compile(r"\b(in|from now|from|now|after|within|later|baad|bad|ke baad|ke bad|mein|me|and|aur)\b")
+_HALF = _re.compile(r"\b(half an hour|half hour|aadha ghanta|adha ghanta|aadhe ghante|aadha ghante)\b")
+
+
+def _humanize(delta: timedelta) -> str:
+    secs = int(delta.total_seconds())
+    for size, name in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if secs >= size and secs % size == 0:
+            n = secs // size
+            return f"{n} {name}{'s' if n != 1 else ''}"
+    if secs >= 120:
+        return f"{secs // 60} min {secs % 60} sec" if secs % 60 else f"{secs // 60} minutes"
+    return f"{secs} second{'s' if secs != 1 else ''}"
+
+
+def _parse_duration(exp: str):
+    """'in 10 seconds from now', '2 ghante baad', 'an hour', 'half an hour', '1 hour 30 minutes' -> timedelta.
+    Returns None unless the WHOLE phrase is a duration."""
+    text = exp
+    total = 0.0
+    if _HALF.search(text):
+        total += 1800
+        text = _HALF.sub(" ", text)
+    if _re.search(r"\bdedh ghant[aei]\b", text):
+        total += 5400
+        text = _re.sub(r"\bdedh ghant[aei]\b", " ", text)
+    found = False
+    def take(m):
+        nonlocal total, found
+        n = m.group("n")
+        n = float(n) if n[0].isdigit() else _NUMWORDS[n]
+        for i, (_, secs) in enumerate(_UNITS):
+            if m.group(f"u{i}"):
+                total += n * secs
+                found = True
+        return " "
+    text = _DUR_PART.sub(take, text)
+    text = _DUR_NOISE.sub(" ", text)
+    if (not found and total == 0) or text.strip():
+        return None
+    return timedelta(seconds=total)
+
+
+_TIME = _re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|baje|bje)?\b")
+# part of day -> (default hour, whether a bare hour 1-11 beside it means PM)
+_PARTS = {"subah": (9, False), "savere": (9, False), "savera": (9, False), "morning": (9, False),
+          "dopahar": (14, True), "dophar": (14, True), "afternoon": (14, True),
+          "shaam": (18, True), "sham": (18, True), "evening": (18, True),
+          "raat": (21, True), "rat": (21, True), "night": (21, True), "tonight": (21, True)}
+_WEEKDAYS = {"monday": 0, "somvar": 0, "somwar": 0, "tuesday": 1, "mangalvar": 1, "mangalwar": 1,
+             "wednesday": 2, "budhvar": 2, "budhwar": 2, "thursday": 3, "guruvar": 3, "guruwar": 3,
+             "veervar": 3, "friday": 4, "shukravar": 4, "shukrawar": 4, "saturday": 5, "shanivar": 5,
+             "shaniwar": 5, "sunday": 6, "ravivar": 6, "raviwar": 6, "itwar": 6, "itvar": 6}
+_FILLER = {"at", "ko", "pe", "par", "ka", "ki", "ke", "on", "next", "agle", "agla", "aane", "wale", "wala", "is", "this"}
+
+
+def _normalize(exp: str) -> str:
+    """Devanagari -> Latin, Devanagari digits -> ASCII, lowercase, squeeze spaces."""
+    exp = transliterate(exp.translate(_DIGITS)) if has_devanagari(exp) else exp
+    exp = exp.lower().replace("बजे", "baje")
+    return " ".join(exp.replace(",", " ").split())
+
+
+def _find_time(exp: str):
+    """First number that is clearly a time (am/pm/baje or hh:mm), ignoring date digits like 2026-11-05."""
+    for m in _TIME.finditer(exp):
+        before = exp[max(0, m.start() - 1):m.start()]
+        if before in ("-", "/"):
+            continue
+        if m.group(3) or m.group(2):
+            return m
+    return None
+
+
+def _extract_time(exp: str):
+    """Pull a time of day out of the phrase -> ((hour, minute) | None, remaining text)."""
+    part = next((w for w in _PARTS if _re.search(rf"\b{w}\b", exp)), None)
+    default_h, pm_bias = _PARTS[part] if part else (None, False)
+    m = _find_time(exp)
+    if m:
+        h, mi, suffix = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        if h > 23 or mi > 59:
+            return None, exp
+        if suffix == "pm" and h < 12:
+            h += 12
+        elif suffix == "am" and h == 12:
+            h = 0
+        elif suffix in (None, "baje", "bje") and h <= 12:
+            if part and pm_bias and h < 12:
+                h += 12                                  # "shaam 5 baje", "raat 9 baje"
+            elif not part and suffix in ("baje", "bje"):
+                h = h + 12 if 1 <= h <= 6 else h         # "5 baje" -> shop hours
+        exp = exp[:m.start()] + " " + exp[m.end():]
+        hm = (h, mi)
+    elif part:
+        hm = (default_h, 0)
+    else:
+        return None, " ".join(t for t in exp.split() if t not in _FILLER)
+    if part:
+        exp = _re.sub(rf"\b{part}\b", " ", exp)
+    return hm, " ".join(t for t in exp.split() if t not in _FILLER)
+
+
+def _month_bounds(y: int, m: int):
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def _next_weekday(today: date, wd: int) -> date:
+    return today + timedelta(days=(wd - today.weekday()) % 7 or 7)
+
+
 async def execute_resolve_date(op: ResolveDateOp, ctx: ExecutionContext) -> ResultEnvelope:
-    """Python-side resolution of common English/Hinglish date phrases (no LLM date math)."""
-    exp = op.expression.lower().strip()
-    today = ctx.now_ist.date()
+    """Python-side resolution of English/Hinglish/Devanagari date phrases (no LLM date math)."""
+    exp = _normalize(op.expression)
+    now = ctx.now_ist
+    today = now.date()
+    is_dt = op.mode.value == "datetime"
     prefer = op.prefer.value
+    if is_dt and prefer == "auto":
+        prefer = "future"                        # reminders are never in the past ("kal" = tomorrow)
+
+    def ask_when():
+        return ResultEnvelope(status="needs_input", data={
+            "field": "time", "message": "I didn't catch when. When should I remind you? (e.g. tomorrow 5pm)"})
+
+    # ---- relative durations: "in 10 seconds from now", "2 ghante baad", "half an hour", ...
+    if is_dt:
+        delta = _parse_duration(exp)
+        if delta is not None:
+            when = (now + delta).replace(microsecond=0)
+            return ResultEnvelope(status="ok", data={
+                "assumption": "In " + _humanize(delta),
+                "resolved_date": when.date().isoformat(), "resolved_from": when.date().isoformat(),
+                "resolved_to": when.date().isoformat(), "resolved_datetime": when.isoformat()})
+
+    time_of_day, exp = _extract_time(exp) if is_dt else (None, exp)
+
     d_from = d_to = None
     assumption = ""
+    recognized = True
 
     def one(d: date, label: str):
         nonlocal d_from, d_to, assumption
         d_from = d_to = d
         assumption = label
 
-    if exp in ("today", "aaj", "aj"):
+    if exp in ("", "today", "aaj", "aj", "tonight"):
         one(today, "Today")
+    elif exp in ("day after tomorrow", "parso", "parson", "parsoon") and (prefer != "past" or exp == "day after tomorrow"):
+        one(today + timedelta(days=2), "Day after tomorrow")
     elif exp in ("yesterday", "beeta hua kal", "kal") and not (exp == "kal" and prefer == "future"):
         one(today - timedelta(days=1), "Yesterday")
     elif exp in ("tomorrow", "kal", "aane wala kal"):
         one(today + timedelta(days=1), "Tomorrow")
-    elif exp in ("parso", "day before yesterday"):
+    elif exp in ("parso", "parson", "day before yesterday"):
         one(today - timedelta(days=2), "Day before yesterday")
-    elif exp in ("this week", "is hafte", "is week"):
-        d_from = today - timedelta(days=today.weekday()); d_to = today; assumption = "This week (Mon to today)"
+    elif exp in _WEEKDAYS:
+        one(_next_weekday(today, _WEEKDAYS[exp]), exp.capitalize())
+    elif exp in ("this week", "is hafte", "is week", "hafte"):
+        d_from, d_to = today - timedelta(days=today.weekday()), today; assumption = "This week (Mon to today)"
     elif exp in ("last week", "pichle hafte", "pichhle hafte"):
         end = today - timedelta(days=today.weekday() + 1)
         d_from, d_to = end - timedelta(days=6), end; assumption = "Last week (Mon-Sun)"
-    elif exp in ("this month", "is mahine", "is month"):
+    elif exp in ("this month", "is mahine", "is month", "mahine"):
         d_from, d_to = _month_bounds(today.year, today.month)[0], today; assumption = "This month so far"
     elif exp in ("last month", "pichle mahine", "pichhle mahine"):
         y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
@@ -697,24 +895,40 @@ async def execute_resolve_date(op: ResolveDateOp, ctx: ExecutionContext) -> Resu
     else:
         months = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
         months.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
-        parsed = None
         try:
-            parsed = date.fromisoformat(exp)
+            one(date.fromisoformat(exp), exp)
         except ValueError:
-            pass
-        if parsed:
-            one(parsed, parsed.isoformat())
-        elif exp in months:
-            m = months[exp]
-            y = today.year if m <= today.month else today.year - 1
-            d_from, d_to = _month_bounds(y, m); assumption = f"{calendar.month_name[m]} {y}"
-        else:
-            one(today, f"Assuming today for '{exp}'")
+            if exp in months:
+                m = months[exp]
+                y = today.year if m <= today.month else today.year - 1
+                d_from, d_to = _month_bounds(y, m); assumption = f"{calendar.month_name[m]} {y}"
+            else:
+                recognized = False
+
+    if not recognized:
+        if is_dt:
+            return ask_when()                    # never guess a reminder time
+        one(today, f"Assuming today for '{exp}'")
 
     data = {"assumption": assumption, "resolved_date": d_from.isoformat(),
             "resolved_from": d_from.isoformat(), "resolved_to": d_to.isoformat()}
-    if op.mode.value == "datetime":
-        data["resolved_datetime"] = datetime(d_from.year, d_from.month, d_from.day, 10, 0, tzinfo=IST).isoformat()
+    if is_dt:
+        explicit_date = exp not in ("", "today", "aaj", "aj", "tonight")
+        if time_of_day:
+            hh, mm = time_of_day
+        elif d_from == today:                    # "remind me today" with no time: next full hour
+            nxt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            hh, mm = nxt.hour, 0
+            if nxt.date() != today:
+                return ask_when()
+        else:
+            hh, mm = 10, 0
+        when = datetime(d_from.year, d_from.month, d_from.day, hh, mm, tzinfo=IST)
+        if time_of_day and when <= now and d_from == today and not explicit_date:
+            when += timedelta(days=1)            # "5pm" said after 5pm means tomorrow
+            assumption = "Tomorrow"
+        data.update(resolved_datetime=when.isoformat(), resolved_date=when.date().isoformat(),
+                    assumption=f"{assumption} {when.strftime('%I:%M %p').lstrip('0')}")
     return ResultEnvelope(status="ok", data=data)
 
 async def execute_calculate(op: CalculateOp, ctx: ExecutionContext) -> ResultEnvelope:
@@ -828,7 +1042,9 @@ async def _party_id_from_ref(ctx: ExecutionContext, ref, default_type: str):
     if ref.get("ref_type") == "existing":
         return int(ref["party_id"])
     name = ref["name"].strip()
-    norm = name.lower()
+    if has_devanagari(name):
+        name = transliterate(name).title()      # keep stored names in one script so matching stays reliable
+    norm = search_key(name)
     row = (await ctx.conn.execute(
         select(parties.c.id).where(parties.c.business_id == ctx.business_id, parties.c.normalized_name == norm).limit(1)
     )).fetchone()

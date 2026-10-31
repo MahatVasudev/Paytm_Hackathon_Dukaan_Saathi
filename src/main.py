@@ -23,6 +23,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from pathlib import Path
 
 from src.bot import docai, stt
+from src.bot.reminders import run_scheduler
+from src.server.templates.output import esc, render_template, select_and_render
 from src.server.database.ops.utils import ExecutionContext
 from src.server.database.sqltypes import businesses
 from src.bot.llm import DukaanOrchestrator  # adjust path to your orchestrator file
@@ -80,6 +82,11 @@ async def get_or_create_business_id(conn, chat_id: str, sender_name: str) -> int
 # -----------------------------------------------------------------------------
 # 3. Response Dispatcher / Formatter
 # -----------------------------------------------------------------------------
+def cb(data: str) -> str:
+    """Telegram callback_data is limited to 64 BYTES (Devanagari chars are 3 bytes each)."""
+    return data.encode("utf-8")[:64].decode("utf-8", errors="ignore")
+
+
 def md(text) -> str:
     """Escape Telegram legacy-Markdown specials in dynamic text (unescaped _ or * makes send fail)."""
     out = str(text)
@@ -105,7 +112,7 @@ async def dispatch_orchestrator_result(msg, result: dict, context: ContextTypes.
         if issue_type == "not_found":
             party_name = issue_data.get("queried_name") or "this contact"
             keyboard = [
-                [InlineKeyboardButton(f"➕ Add '{party_name}' as new"[:60], callback_data=f"clarify:new_party:{party_name}"[:64])],
+                [InlineKeyboardButton(f"➕ Add '{party_name}' as new"[:60], callback_data=cb(f"clarify:new_party:{party_name}"))],
                 [InlineKeyboardButton("✏️ Search different name", callback_data="clarify:retry")],
             ]
             await msg.reply_text(
@@ -139,15 +146,42 @@ async def dispatch_orchestrator_result(msg, result: dict, context: ContextTypes.
                     opt_label = opt.get("label", opt_id)
                 else:
                     opt_id = opt_label = str(opt)
-                keyboard.append([InlineKeyboardButton(str(opt_label), callback_data=f"clarify:opt:{opt_id}"[:64])])
+                keyboard.append([InlineKeyboardButton(str(opt_label), callback_data=cb(f"clarify:opt:{opt_id}"))])
             field = str(issue_data.get("field") or "").replace("_", " ")
             await msg.reply_text(f"Please choose{' ' + field if field else ''}:",
                                  reply_markup=InlineKeyboardMarkup(keyboard))
             return
 
         # 4. Free-text question
-        field = str(issue_data.get("field") or issue_data.get("message") or issue_type).replace("_", " ")
+        if issue_data.get("message"):
+            await msg.reply_text(str(issue_data["message"]))
+            return
+        field = str(issue_data.get("field") or issue_type).replace("_", " ")
         await msg.reply_text(f"Could you please clarify: {field}?")
+
+    elif res_type == "multi":
+        context.user_data.pop("awaiting_clarification", None)
+        parts = [t for r in result["results"] if (t := select_and_render(r))]
+        if parts:
+            await msg.reply_text("\n\n".join(parts), parse_mode="Markdown")
+        else:
+            await msg.reply_text("No records found.")
+
+    elif res_type == "party_not_found":
+        context.user_data.pop("awaiting_clarification", None)
+        await msg.reply_text(render_template("party_not_found", {"queried_name": esc(result.get("queried_name", ""))}),
+                             parse_mode="Markdown")
+
+    elif res_type in ("table_view", "template") and (text := select_and_render(result)):
+        context.user_data.pop("awaiting_clarification", None)
+        data = result.get("data") or {}
+        kb = None
+        if "action_id" in data:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Save", callback_data=f"pa:confirm:{data['action_id']}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"pa:cancel:{data['action_id']}"),
+            ]])
+        await msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
     elif res_type == "table_view":
         context.user_data.pop("awaiting_clarification", None)
@@ -374,7 +408,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 5. Application Loop
 # -----------------------------------------------------------------------------
 def main():
-    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    async def post_init(application):
+        # Reminder sender runs alongside the bot; plain templates, no LLM
+        application.bot_data["reminder_task"] = asyncio.create_task(run_scheduler(engine, application.bot))
+
+    async def post_shutdown(application):
+        task = application.bot_data.get("reminder_task")
+        if task:
+            task.cancel()
+
+    app = (ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"])
+           .post_init(post_init).post_shutdown(post_shutdown).build())
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
